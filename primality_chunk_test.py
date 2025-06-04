@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
-"""Exhaustive primality testing for huge numbers using chunk arithmetic.
+"""Probabilistic primality testing for huge numbers using chunk arithmetic.
 
 This script demonstrates trial division on extremely large integers such as
 ``10**1_000_000 + 61`` represented as strings.  The candidate is split into
 base-``10**chunk_size`` chunks so that modulus operations can be computed
 incrementally without ever forming a single gigantic integer object.
 
-Given a center of ``10**exp`` and an offset ``k``, the program reports an
-approximate time to fully confirm primality using pure trial division.
-During testing, it prints a rough confidence based on how far it has
-progressed toward the dynamic stopping point ``candidate // divisor``.
+Given a center of ``10**exp`` and an offset ``k``, the program performs a
+small prime-divisor scan before attempting an ``in-house`` factor search using
+Pollard's Rho.  This reduces the candidate without ever materialising the full
+integer when screening small divisors.
 
 This approach is illustrative only.  Exhaustively checking values near
-``10**1_000_000`` would take far longer than the age of the universe.
+``10**1_000_000`` would take far longer than the age of the universe. The
+division loop now skips composite divisors by iterating only over prime numbers.
 """
 
 from __future__ import annotations
@@ -21,7 +22,14 @@ import argparse
 import math
 import sys
 import time
-from typing import List, Tuple
+from typing import Generator, List, Tuple
+import random
+
+try:
+    import gmpy2  # type: ignore
+    HAVE_GMPY2 = True
+except Exception:
+    HAVE_GMPY2 = False
 
 
 if hasattr(sys, "set_int_max_str_digits"):
@@ -128,8 +136,181 @@ def measure_ops_per_sec(candidate: str, chunk_size: int = 9, samples: int = 1000
     return samples / (end - start)
 
 
+def prime_generator() -> Generator[str, None, None]:
+    """Yield prime numbers as strings in ascending order."""
+    primes = [2]
+    yield "2"
+    candidate = 3
+    while True:
+        isprime = True
+        limit = int(math.isqrt(candidate))
+        for p in primes:
+            if p > limit:
+                break
+            if candidate % p == 0:
+                isprime = False
+                break
+        if isprime:
+            primes.append(candidate)
+            yield str(candidate)
+        candidate += 2
+
+
 # ---------------------------------------------------------------------------
-# Exhaustive primality test
+# Miller--Rabin primality checks
+# ---------------------------------------------------------------------------
+
+def miller_rabin(n: int, rounds: int = 7) -> bool:
+    if n < 2:
+        return False
+    if n in (2, 3):
+        return True
+    if n % 2 == 0 or n % 3 == 0:
+        return False
+
+    d, s = n - 1, 0
+    while d % 2 == 0:
+        d //= 2
+        s += 1
+    for _ in range(rounds):
+        a = random.randrange(2, n - 2)
+        x = pow(a, d, n)
+        if x == 1 or x == n - 1:
+            continue
+        for _ in range(s - 1):
+            x = pow(x, 2, n)
+            if x == n - 1:
+                break
+        else:
+            return False
+    return True
+
+
+def miller_rabin_big(num_str: str, rounds: int = 7) -> bool:
+    """Run Miller--Rabin on ``num_str`` using big-int arithmetic."""
+    if len(num_str) > 10_000_000:
+        raise ValueError("Number too large for Miller-Rabin test")
+
+    if HAVE_GMPY2:
+        try:
+            return bool(gmpy2.is_prime(gmpy2.mpz(num_str), rounds))
+        except Exception:
+            pass
+
+    n = int(num_str)
+    return miller_rabin(n, rounds)
+
+
+# ---------------------------------------------------------------------------
+# Pollard's Rho factor search
+# ---------------------------------------------------------------------------
+
+def pollards_rho(n: int, iterations: int = 10000) -> int | None:
+    """Return a non-trivial factor of ``n`` or ``None`` if not found."""
+    if n % 2 == 0:
+        return 2
+    if n % 3 == 0:
+        return 3
+    if n < 2:
+        return None
+
+    while True:
+        x = random.randrange(2, n - 1)
+        y = x
+        c = random.randrange(1, n - 1)
+        d = 1
+        f = lambda v: (v * v + c) % n
+        for _ in range(iterations):
+            if d == n:
+                break
+            x = f(x)
+            y = f(f(y))
+            d = math.gcd(abs(x - y), n)
+            if d > 1:
+                break
+        if 1 < d < n:
+            return d
+        if d == n:
+            continue
+        return None
+
+
+def pollards_rho_big(num_str: str, iterations: int = 10000) -> int | None:
+    """Attempt to find a non-trivial factor of ``num_str`` using Pollard's Rho."""
+    if len(num_str) > 10_000_000:
+        raise ValueError("Number too large for Pollard's Rho")
+
+    if HAVE_GMPY2:
+        try:
+            n = gmpy2.mpz(num_str)
+            if n % 2 == 0:
+                return 2
+            if n % 3 == 0:
+                return 3
+            state = gmpy2.random_state(random.randrange(1, 2**32))
+            while True:
+                x = gmpy2.mpz_random(state, n - 2) + 2
+                y = x
+                c = gmpy2.mpz_random(state, n - 1) + 1
+                d = gmpy2.mpz(1)
+                for _ in range(iterations):
+                    if d == n:
+                        break
+                    x = (x * x + c) % n
+                    y = (y * y + c) % n
+                    y = (y * y + c) % n
+                    d = gmpy2.gcd(abs(x - y), n)
+                    if d > 1:
+                        break
+                if 1 < d < n:
+                    return int(d)
+                if d == n:
+                    continue
+                return None
+        except Exception:
+            pass
+
+    n = int(num_str)
+    return pollards_rho(n, iterations)
+
+
+# ---------------------------------------------------------------------------
+# Combined check
+# ---------------------------------------------------------------------------
+
+def isprime_fast(
+    num_str: str,
+    chunk_size: int = 9,
+    trial_limit: int = 1000,
+    rho_iters: int = 10000,
+) -> bool:
+    """Probabilistic primality test with Pollard's Rho fallback."""
+    base = 10 ** chunk_size
+    chunks = split_to_chunks(num_str, chunk_size)
+
+    prime_gen = prime_generator()
+    divisor = next(prime_gen)
+    while int(divisor) <= trial_limit:
+        if chunks_mod(chunks, divisor, base) == 0:
+            return False
+        divisor = next(prime_gen)
+
+    if len(num_str) <= 1_000_000:
+        try:
+            return miller_rabin_big(num_str)
+        except Exception:
+            pass
+
+    factor = pollards_rho_big(num_str, rho_iters)
+    if factor is not None:
+        print(f"Found factor {factor}")
+        return False
+
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Exhaustive primality test (legacy)
 # ---------------------------------------------------------------------------
 
 def exhaustive_isprime(num_str: str, chunk_size: int = 9) -> bool:
@@ -140,7 +321,8 @@ def exhaustive_isprime(num_str: str, chunk_size: int = 9) -> bool:
     print("Estimated trial division speed:", f"{ops_sec:.2f} ops/sec")
     print("Estimated time to complete:", estimate_time(num_str, ops_sec))
 
-    divisor = "2"
+    prime_gen = prime_generator()
+    divisor = next(prime_gen)
     limit_chunks, _ = chunks_divide(chunks, divisor, base)
     while True:
         if chunks_mod(chunks, divisor, base) == 0:
@@ -149,7 +331,7 @@ def exhaustive_isprime(num_str: str, chunk_size: int = 9) -> bool:
         limit_chunks, _ = chunks_divide(chunks, divisor, base)
         if compare_chunks_str_int(limit_chunks, divisor, chunk_size) <= 0:
             break
-        divisor = str(int(divisor) + 1)
+        divisor = next(prime_gen)
         if int(divisor) % 1000 == 0:
             progress = math.log10(int(divisor)) / ((len(num_str) + 1) // 2)
             print(f"Checked up to {divisor}, confidence ~{progress*100:.2f}%")
@@ -159,7 +341,9 @@ def exhaustive_isprime(num_str: str, chunk_size: int = 9) -> bool:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Exhaustive primality check using chunk arithmetic")
+    parser = argparse.ArgumentParser(
+        description="Probabilistic primality check using chunk arithmetic"
+    )
     parser.add_argument("exp", type=int, help="Exponent in 10**exp + k")
     parser.add_argument("k", type=int, help="Offset added to 10**exp")
     parser.add_argument("--chunk", type=int, default=9, help="Chunk size")
@@ -167,7 +351,7 @@ if __name__ == "__main__":
 
     candidate = number_str_from_power_offset(args.exp, args.k)
     print("Testing candidate:", f"1e+{args.exp} + {args.k}")
-    isprime = exhaustive_isprime(candidate, args.chunk)
+    isprime = isprime_fast(candidate, args.chunk)
     if isprime:
         print("Likely prime (no factors found)")
     else:
