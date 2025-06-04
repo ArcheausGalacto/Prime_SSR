@@ -9,6 +9,12 @@ from sympy import primerange
 from sympy.ntheory.primetest import mr, is_strong_lucas_prp
 
 try:
+    from numba import cuda  # type: ignore
+    HAVE_CUDA = cuda.is_available()
+except Exception:
+    HAVE_CUDA = False
+
+try:
     import gmpy2  # type: ignore
     HAVE_GMPY2 = True
 except Exception:
@@ -75,6 +81,49 @@ def miller_rabin(n: int, rounds: int = 7) -> bool:
             return False
     return True
 
+if HAVE_CUDA:
+    @cuda.jit
+    def _mr_kernel(n, d, s, bases, results):
+        idx = cuda.grid(1)
+        if idx >= bases.size:
+            return
+        a = bases[idx]
+        x = 1 % n
+        base = a % n
+        exp = d
+        while exp > 0:
+            if exp & 1:
+                x = (x * base) % n
+            base = (base * base) % n
+            exp >>= 1
+        if x == 1 or x == n - 1:
+            results[idx] = 1
+            return
+        for _ in range(s - 1):
+            x = (x * x) % n
+            if x == n - 1:
+                results[idx] = 1
+                return
+        results[idx] = 0
+
+    def miller_rabin_gpu(n: int, rounds: int = 7):
+        if n.bit_length() > 63:
+            return None
+        d, s = n - 1, 0
+        while (d & 1) == 0:
+            d >>= 1
+            s += 1
+        bases = np.random.randint(2, n - 2, size=rounds, dtype=np.uint64)
+        d_device = np.uint64(d)
+        s_device = np.uint64(s)
+        bases_device = cuda.to_device(bases)
+        results_device = cuda.device_array(bases.shape[0], dtype=np.uint8)
+        threads_per_block = 32
+        blocks = (bases.shape[0] + threads_per_block - 1) // threads_per_block
+        _mr_kernel[blocks, threads_per_block](n, d_device, s_device, bases_device, results_device)
+        results = results_device.copy_to_host()
+        return bool(results.all())
+
 def fast_isprime(n: int) -> bool:
     """Fast probabilistic primality test."""
     if n < 2:
@@ -86,6 +135,14 @@ def fast_isprime(n: int) -> bool:
     for p in small_primes:
         if n % p == 0:
             return False
+
+    if HAVE_CUDA and n.bit_length() <= 63:
+        try:
+            result_gpu = miller_rabin_gpu(n, rounds=7)
+            if result_gpu is not None:
+                return result_gpu
+        except Exception:
+            pass
 
     if HAVE_GMPY2:
         return bool(gmpy2.is_prime(n))
