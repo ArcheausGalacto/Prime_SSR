@@ -73,8 +73,8 @@ def split_to_chunks(num_str: str, chunk_size: int = 9) -> list[int]:
 def chunks_mod(chunks: list[int], divisor: int, base: int) -> int:
     """Return the modulus of a large number expressed as chunks."""
     rem = 0
-    for ch in reversed(chunks):
-        rem = (ch + rem * base) % divisor
+    for ch in chunks:
+        rem = (rem * base + ch) % divisor
     return rem
 
 def is_divisible_chunked(num_str: str, divisor: int, chunk_size: int = 9) -> bool:
@@ -83,11 +83,21 @@ def is_divisible_chunked(num_str: str, divisor: int, chunk_size: int = 9) -> boo
     return chunks_mod(chunks, divisor, base) == 0
 
 def trial_division_chunked(num_str: str, limit: int = 100000, chunk_size: int = 9) -> bool:
-    """Return False if num_str is divisible by any prime <= limit."""
+    """Return False if ``num_str`` has a small prime factor <= limit."""
+    base = 10 ** chunk_size
+    chunks = split_to_chunks(num_str, chunk_size)
     for p in primerange(2, limit + 1):
-        if is_divisible_chunked(num_str, p, chunk_size):
+        if chunks_mod(chunks, p, base) == 0:
             return False
     return True
+
+def number_str_from_power_offset(exp: int, offset: int) -> str:
+    """Return decimal string for ``10**exp + offset``."""
+    offset_str = str(offset)
+    zeros = exp - len(offset_str)
+    if zeros < 0:
+        raise ValueError("offset must be smaller than 10**exp")
+    return "1" + "0" * zeros + offset_str
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 2) Fast primality: Baillie–PSW + Miller–Rabin fallback
@@ -214,9 +224,12 @@ def fast_isprime_big(num_str: str, trial_limit: int = 100000, chunk_size: int = 
 # ─────────────────────────────────────────────────────────────────────────────
 # 3) √k‐enhanced oscillator fit parameters
 # ─────────────────────────────────────────────────────────────────────────────
-ω_osc = 2 * math.pi / 6 
+ω_osc = 2 * math.pi / 6
 m_osc, b_osc, D_osc = 0.000856281, -0.211299, 0.0705661
 A_osc, B_osc    = -7.7839e-05, 0.0011218
+# These empirical constants model prime density with a √k-enhanced
+# oscillator. Evaluating ``f(k)`` helps prioritize offsets more likely to
+# contain primes, drastically shrinking the search space.
 
 def f(k: int) -> float:
     safe_k = k if k >= 0 else 0 
@@ -275,10 +288,17 @@ def find_candidate(center: int,
         for k_offset in tqdm(sorted(local_minima_offsets, reverse=True),
                              desc=f"Testing local minima (δ₀={current_delta0_fc})", unit="k", leave=False):
             cand = center + k_offset
-            if cand != 2 and cand % 2 == 0: continue
-            if cand != 3 and cand % 3 == 0: continue
-            
-            if fast_isprime(cand):
+            if cand != 2 and cand % 2 == 0:
+                continue
+            if cand != 3 and cand % 3 == 0:
+                continue
+
+            cand_str = str(cand)
+            if len(cand_str) > 10000:
+                is_p = fast_isprime_big(cand_str)
+            else:
+                is_p = fast_isprime(cand)
+            if is_p:
                 return k_offset, cand, cnt[ks.index(k_offset)]
 
     # b) survivors with refined selection, re-ranking, and parallel testing
@@ -333,18 +353,35 @@ def find_candidate(center: int,
             # print(f"INFO: Testing {len(candidate_values)} survivors sequentially (small list or few processes). δ₀={current_delta0_fc}, {desc_string_detail}")
             for i, k_offset in enumerate(ordered_k_offsets_to_test):
                 cand = candidate_values[i]
-                if cand != 2 and cand % 2 == 0: continue
-                if cand != 3 and cand % 3 == 0: continue
-                if fast_isprime(cand):
+                if cand != 2 and cand % 2 == 0:
+                    continue
+                if cand != 3 and cand % 3 == 0:
+                    continue
+
+                cand_str = str(cand)
+                if len(cand_str) > 10000:
+                    is_p = fast_isprime_big(cand_str)
+                else:
+                    is_p = fast_isprime(cand)
+                if is_p:
                     return k_offset, cand, actual_target_min_c
         else:
             # print(f"INFO: Testing {len(candidate_values)} survivors in parallel with {num_processes} processes. δ₀={current_delta0_fc}, {desc_string_detail}")
             try:
-                with Pool(processes=num_processes) as pool:
-                    # `map` preserves order, returns list of booleans
-                    chunk_size = max(1, len(candidate_values) // (num_processes * 4) +1) # Heuristic for chunksize
-                    primality_results = pool.map(fast_isprime, candidate_values, chunksize=chunk_size)
-                
+                if all(len(str(v)) <= 10000 for v in candidate_values):
+                    with Pool(processes=num_processes) as pool:
+                        chunk_size = max(1, len(candidate_values) // (num_processes * 4) + 1)
+                        primality_results = pool.map(fast_isprime, candidate_values, chunksize=chunk_size)
+                else:
+                    # Values are enormous; avoid multiprocessing overhead
+                    primality_results = []
+                    for v in candidate_values:
+                        cand_str = str(v)
+                        if len(cand_str) > 10000:
+                            primality_results.append(fast_isprime_big(cand_str))
+                        else:
+                            primality_results.append(fast_isprime(v))
+
                 for i, is_p in enumerate(primality_results):
                     if is_p:
                         k_offset_prime = ordered_k_offsets_to_test[i]
@@ -353,11 +390,18 @@ def find_candidate(center: int,
             except Exception as e:
                 print(f"ERROR: Exception during parallel survivor testing: {e}")
                 print("INFO: Falling back to sequential survivor testing due to error.")
-                for i, k_offset_seq in enumerate(ordered_k_offsets_to_test): # Use a different loop var name
+                for i, k_offset_seq in enumerate(ordered_k_offsets_to_test):
                     cand_seq = candidate_values[i]
-                    if cand_seq != 2 and cand_seq % 2 == 0: continue
-                    if cand_seq != 3 and cand_seq % 3 == 0: continue
-                    if fast_isprime(cand_seq):
+                    if cand_seq != 2 and cand_seq % 2 == 0:
+                        continue
+                    if cand_seq != 3 and cand_seq % 3 == 0:
+                        continue
+                    cand_str = str(cand_seq)
+                    if len(cand_str) > 10000:
+                        is_p = fast_isprime_big(cand_str)
+                    else:
+                        is_p = fast_isprime(cand_seq)
+                    if is_p:
                         return k_offset_seq, cand_seq, actual_target_min_c
     return None, None, None
 
